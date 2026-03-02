@@ -204,6 +204,7 @@ void handleImagesList();
 void handleImagesInspect();
 void handleImagesDelete();
 void handleDisplayShow();
+void handleSdcardBrowse();
 void handleOshaRefresh();
 void handleOshaConfig();
 void handleUiRefresh();
@@ -260,6 +261,54 @@ void handleShutdown();
 void handleUploadStream();
 void handleUploadDone();
 bool streamHtmlFromStorage(const char *path);
+String urlEncode(const String &input);
+String htmlEscape(const String &input);
+String normalizeSdcardPath(const String &path);
+
+String urlEncode(const String &input) {
+  String out;
+  out.reserve(input.length() * 3);
+  for (size_t i = 0; i < input.length(); i++) {
+    uint8_t c = (uint8_t)input.charAt(i);
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
+      out += (char)c;
+    } else {
+      char hex[4];
+      snprintf(hex, sizeof(hex), "%%%02X", c);
+      out += hex;
+    }
+  }
+  return out;
+}
+
+String htmlEscape(const String &input) {
+  String out;
+  out.reserve(input.length() + 16);
+  for (size_t i = 0; i < input.length(); i++) {
+    char c = input.charAt(i);
+    if (c == '&') out += "&amp;";
+    else if (c == '<') out += "&lt;";
+    else if (c == '>') out += "&gt;";
+    else if (c == '"') out += "&quot;";
+    else if (c == '\'') out += "&#39;";
+    else out += c;
+  }
+  return out;
+}
+
+String normalizeSdcardPath(const String &rawPath) {
+  String path = rawPath;
+  if (path.length() == 0) return "/";
+
+  if (!path.startsWith("/")) path = "/" + path;
+  while (path.indexOf("//") >= 0) path.replace("//", "/");
+
+  if (path.indexOf("..") >= 0) return "";
+
+  if (path.length() > 1 && path.endsWith("/")) path.remove(path.length() - 1);
+  return path;
+}
 
 void logWebRequest(const char *handlerName) {
   String remote = server.client().remoteIP().toString();
@@ -947,6 +996,85 @@ void handleUi() {
     return;
   }
   handleRoot(); // Same as root for now
+}
+
+void handleSdcardBrowse() {
+  logWebRequest("handleSdcardBrowse");
+  if (!sdMounted) {
+    server.send(500, "text/html", "<html><body><h3>SD card not detected.</h3></body></html>");
+    return;
+  }
+
+  String reqPath = server.hasArg("path") ? server.arg("path") : "/";
+  String browsePath = normalizeSdcardPath(reqPath);
+  if (browsePath.length() == 0) {
+    server.send(400, "text/html", "<html><body><h3>Invalid path.</h3></body></html>");
+    return;
+  }
+
+  File selected = SD.open(browsePath.c_str(), FILE_READ);
+  if (!selected) {
+    server.send(404, "text/html", "<html><body><h3>Path not found.</h3></body></html>");
+    return;
+  }
+
+  if (!selected.isDirectory()) {
+    String contentType = "application/octet-stream";
+    String fileName = String(selected.name());
+    int slash = fileName.lastIndexOf('/');
+    if (slash >= 0) fileName = fileName.substring(slash + 1);
+    server.sendHeader("Content-Disposition", "inline; filename=\"" + fileName + "\"");
+    server.streamFile(selected, contentType);
+    selected.close();
+    return;
+  }
+
+  String parent = "/";
+  if (browsePath != "/") {
+    int idx = browsePath.lastIndexOf('/');
+    parent = (idx <= 0) ? "/" : browsePath.substring(0, idx);
+  }
+
+  String html =
+    "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>"
+    "<style>body{font-family:sans-serif;max-width:900px;margin:20px auto;padding:0 12px;}"
+    "table{border-collapse:collapse;width:100%;}th,td{padding:8px;border-bottom:1px solid #ddd;text-align:left;}"
+    "a{text-decoration:none;} .dir{font-weight:600;} .muted{color:#666;font-size:12px;}</style>"
+    "</head><body>";
+
+  html += "<h2>SD Card Browser</h2>";
+  html += "<p><b>Current path:</b> <code>" + htmlEscape(browsePath) + "</code></p>";
+  html += "<p><a href='/sdcard?path=" + urlEncode(parent) + "'>⬆ Parent directory</a></p>";
+  html += "<table><tr><th>Name</th><th>Type</th><th>Size</th></tr>";
+
+  while (true) {
+    File entry = selected.openNextFile();
+    if (!entry) break;
+
+    String fullName = String(entry.name());
+    String baseName = fullName;
+    int slash = baseName.lastIndexOf('/');
+    if (slash >= 0) baseName = baseName.substring(slash + 1);
+
+    String entryPath;
+    if (browsePath == "/") entryPath = "/" + baseName;
+    else entryPath = browsePath + "/" + baseName;
+
+    html += "<tr><td>";
+    if (entry.isDirectory()) {
+      html += "<a class='dir' href='/sdcard?path=" + urlEncode(entryPath) + "'>📁 " + htmlEscape(baseName) + "</a>";
+      html += "</td><td>directory</td><td class='muted'>-</td>";
+    } else {
+      html += "<a href='/sdcard?path=" + urlEncode(entryPath) + "'>📄 " + htmlEscape(baseName) + "</a>";
+      html += "</td><td>file</td><td>" + String((unsigned int)entry.size()) + " bytes</td>";
+    }
+    html += "</tr>";
+    entry.close();
+  }
+
+  selected.close();
+  html += "</table><p class='muted'>Tip: click a file to stream/download it in the browser.</p></body></html>";
+  server.send(200, "text/html", html);
 }
 
 void handleSdSetupPage() {
@@ -2081,6 +2209,7 @@ void setupWebServer() {
   server.on("/wifi/clear", HTTP_POST, handleClearWiFi);
 
   server.on("/status", HTTP_GET, handleStatus);
+  server.on("/sdcard", HTTP_GET, handleSdcardBrowse);
   server.on("/sd/setup", HTTP_GET, handleSdSetupPage);
   server.on("/sd/setup/run", HTTP_POST, handleSdSetupRun);
   server.on("/session", HTTP_GET, handleSession);
